@@ -10,7 +10,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
-_DAGS_DIR = Path(__file__).parent
+# resolve() follows the symlink so sys.path points to the real project folder when Airflow loads this from ~/airflow/dags/
+_DAGS_DIR = Path(__file__).resolve().parent
 _RT_DIR = _DAGS_DIR.parent
 _PROJECT_ROOT = _RT_DIR.parent
 sys.path.insert(0, str(_RT_DIR))

@@ -9,8 +9,8 @@ from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-# batch_processing is one level above this dags folder
-_BATCH_DIR = Path(__file__).parent.parent
+# resolve() follows the symlink so sys.path points to the real project folder when Airflow loads this from ~/airflow/dags/
+_BATCH_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_BATCH_DIR))
 
 from pipeline import (  # noqa: E402
