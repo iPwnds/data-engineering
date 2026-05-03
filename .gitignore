@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data files (large)
+*.parquet
+batch_processing/output/
+real_time_processing/output/
+real_time_processing/processed/
+real_time_processing/input/rejected/
+
+# Environment / secrets
+.env
+*.env
+set_azure_env.sh
+
+# Office temp files
+~$*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Airflow
+airflow.db
+airflow.cfg
+logs/
