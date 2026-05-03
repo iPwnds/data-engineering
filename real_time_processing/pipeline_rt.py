@@ -45,7 +45,7 @@ class ValidationResult:
 
     def __str__(self) -> str:
         status = "FATAL" if self.fatal else (
-            "PASS (data-quality issues — rows will be dropped)" if self.errors else "PASS"
+            "PASS (data-quality issues, rows will be dropped)" if self.errors else "PASS"
         )
         lines = [status]
         for e in self.errors:
@@ -55,12 +55,14 @@ class ValidationResult:
         return "\n".join(lines)
 
 
+# loads CSV or XLSX files into a DataFrame; CSV files get encoding auto-detection
 class Reader:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
     def read(self) -> pd.DataFrame:
+        # routes to _read_csv or _read_xlsx based on the file extension; rejects empty or unsupported files before doing any work
         log.info("Reading %s", self.path)
         if not self.path.exists():
             raise FileNotFoundError(f"File not found: {self.path}")
@@ -76,7 +78,7 @@ class Reader:
         return df
 
     def _read_csv(self) -> pd.DataFrame:
-        # try common encodings in order — Amazon export files sometimes arrive as latin-1
+        # try common encodings in order, Amazon export files sometimes arrive as latin-1
         for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
             try:
                 df = pd.read_csv(self.path, encoding=enc, dtype=str)
@@ -84,9 +86,10 @@ class Reader:
                 return df
             except UnicodeDecodeError:
                 continue
-        raise ValueError(f"Could not decode {self.path.name} — may be binary or corrupt")
+        raise ValueError(f"Could not decode {self.path.name}, may be binary or corrupt")
 
     def _read_xlsx(self) -> pd.DataFrame:
+        # openpyxl handles the parsing; any exception is wrapped into a plain readable ValueError
         try:
             df = pd.read_excel(self.path, dtype=str)
             log.info("Decoded as .xlsx")
@@ -95,9 +98,11 @@ class Reader:
             raise ValueError(f"Could not read Excel file: {exc}") from exc
 
 
+# pre-processing check that runs before any cleaning, reports data quality issues and stops immediately if a mandatory column is absent
 class Validator:
 
     def validate(self, df: pd.DataFrame) -> ValidationResult:
+        # checks mandatory columns exist first; then counts nulls, validates ASIN format, confirms prices and ratings are parseable
         log.info("Running pre-processing validation ...")
         result = ValidationResult()
         n = len(df)
@@ -116,64 +121,67 @@ class Validator:
             nulls = df[col].isna().sum()
             if nulls:
                 result.errors.append(
-                    f"{col}: {nulls:,} nulls ({nulls/n:.1%}) — rows will be dropped")
+                    f"{col}: {nulls:,} nulls ({nulls/n:.1%}), rows will be dropped")
 
         # product_id should follow Amazon ASIN format
         bad = (~df["product_id"].dropna().astype(str).str.match(_PRODUCT_ID_RE)).sum()
         if bad:
             result.errors.append(
-                f"product_id: {bad:,} values not matching ASIN format — rows will be dropped")
+                f"product_id: {bad:,} values not matching ASIN format, rows will be dropped")
 
         dupes = df["product_id"].dropna().duplicated().sum()
         if dupes:
             result.errors.append(
-                f"product_id: {dupes:,} duplicates — first occurrence kept")
+                f"product_id: {dupes:,} duplicates, first occurrence kept")
 
-        # prices are stored as strings like ₹1,099 — check they're parseable
+        # prices are stored as strings like ₹1,099, check they're parseable
         for col in ("discounted_price", "actual_price"):
             parsed = pd.to_numeric(
                 df[col].str.replace(r"[₹,]", "", regex=True), errors="coerce")
             unparseable = parsed.isna().sum() - df[col].isna().sum()
             if unparseable:
                 result.errors.append(
-                    f"{col}: {unparseable:,} unparseable values — rows will be dropped")
+                    f"{col}: {unparseable:,} unparseable values, rows will be dropped")
 
         # rating should be 1.0-5.0
         parsed = pd.to_numeric(df["rating"], errors="coerce")
         unparseable = parsed.isna().sum() - df["rating"].isna().sum()
         if unparseable:
             result.errors.append(
-                f"rating: {unparseable:,} unparseable values — rows will be dropped")
+                f"rating: {unparseable:,} unparseable values, rows will be dropped")
         out_of_range = ((parsed < 1) | (parsed > 5)).sum()
         if out_of_range:
             result.errors.append(
-                f"rating: {out_of_range:,} values outside 1–5 — rows will be dropped")
+                f"rating: {out_of_range:,} values outside 1–5, rows will be dropped")
 
-        # discount_percentage stored as "64%" — check parseability
+        # discount_percentage stored as "64%", check parseability
         parsed = pd.to_numeric(
             df["discount_percentage"].str.replace("%", "", regex=False), errors="coerce")
         unparseable = parsed.isna().sum() - df["discount_percentage"].isna().sum()
         if unparseable:
             result.errors.append(
-                f"discount_percentage: {unparseable:,} unparseable values — rows will be dropped")
+                f"discount_percentage: {unparseable:,} unparseable values, rows will be dropped")
 
         # rating_count is optional but warn if nulls present
         if "rating_count" in df.columns:
             nulls = df["rating_count"].isna().sum()
             if nulls:
                 result.warnings.append(
-                    f"rating_count: {nulls:,} nulls — will be filled with 0")
+                    f"rating_count: {nulls:,} nulls, will be filled with 0")
 
         log.info("Pre-validation result:\n%s", result)
         return result
 
 
+# removes invalid rows in three steps and adds 4 derived columns; every rejected row is captured in self.rejection_log
 class Processor:
 
     def __init__(self) -> None:
         self.rejection_log: pd.DataFrame = pd.DataFrame()
 
     def process(self, df: pd.DataFrame) -> pd.DataFrame:
+        # three-step cleaning: deduplicate by product_id -> drop mandatory nulls -> drop rows with invalid parsed values
+        # then adds top_category, discount_amount, price_tier, and rating_band
         log.info("Processing %d rows ...", len(df))
         df = df.copy()
         parts: list[pd.DataFrame] = []
@@ -186,7 +194,7 @@ class Processor:
             r["rejected_at_step"] = 1
             parts.append(r)
         df = df[~dup]
-        log.info("  Step 1 — removed %d duplicate rows", dup.sum())
+        log.info("  Step 1, removed %d duplicate rows", dup.sum())
 
         # drop rows missing required fields
         mand = list(MANDATORY_COLUMNS & set(df.columns))
@@ -199,7 +207,7 @@ class Processor:
             r["rejected_at_step"] = 2
             parts.append(r)
         df = df[~null_any]
-        log.info("  Step 2 — dropped %d rows (mandatory nulls)", null_any.sum())
+        log.info("  Step 2, dropped %d rows (mandatory nulls)", null_any.sum())
 
         # strip currency symbols and parse all numeric columns
         for col in ("discounted_price", "actual_price"):
@@ -213,7 +221,7 @@ class Processor:
                 df["rating_count"].str.replace(",", "", regex=False), errors="coerce"
             ).fillna(0).astype(int)
 
-        # drop rows with invalid values after parsing — track the first failing condition
+        # drop rows with invalid values after parsing, track the first failing condition
         # per row so the rejection log shows a useful reason rather than just "invalid"
         conds = [
             df["discounted_price"].isna() | (df["discounted_price"] <= 0),
@@ -241,7 +249,7 @@ class Processor:
             r["rejected_at_step"] = 3
             parts.append(r)
         df = df[~bad]
-        log.info("  Step 3 — dropped %d rows (invalid values)", bad.sum())
+        log.info("  Step 3, dropped %d rows (invalid values)", bad.sum())
 
         # derived columns
         df["top_category"]    = df["category"].str.split("|").str[0]
@@ -264,7 +272,7 @@ class Processor:
         else:
             self.rejection_log = pd.DataFrame()
 
-        log.info("Processing complete — %d rows kept, %d rows rejected",
+        log.info("Processing complete, %d rows kept, %d rows rejected",
                  len(df), len(self.rejection_log))
         return df
 
@@ -272,9 +280,11 @@ class Processor:
 _EXPECTED_DERIVED = {"top_category", "discount_amount", "price_tier", "rating_band"}
 
 
+# post-processing sanity check, confirms the processor added all expected columns and no invalid values slipped through
 class BackupValidator:
 
     def validate(self, df: pd.DataFrame) -> ValidationResult:
+        # confirms all 4 derived columns exist, no duplicates remain, prices are positive, and ratings are within 1–5
         log.info("Running backup (post-processing) validation ...")
         result = ValidationResult()
 
@@ -288,7 +298,7 @@ class BackupValidator:
             return result
 
         if df.empty:
-            result.warnings.append("0 valid rows remain — output file will be empty")
+            result.warnings.append("0 valid rows remain, output file will be empty")
             log.info("Backup-validation result:\n%s", result)
             return result
 
@@ -325,6 +335,7 @@ class BackupValidator:
 _AZURE_MAX_RETRIES = 3
 
 
+# saves cleaned CSV, a summary report, and optionally a rejection CSV; then uploads all three to Azure Blob Storage
 class Writer:
 
     def __init__(self, output_dir: str | Path) -> None:
@@ -334,6 +345,7 @@ class Writer:
     def write(self, df: pd.DataFrame, source_name: str,
               rejection_log: pd.DataFrame | None = None,
               original_rows: int | None = None) -> dict[str, Path | str]:
+        # writes the cleaned CSV and text report locally; adds a rejection CSV if any rows were dropped; uploads to Azure if credentials are set
         if rejection_log is None:
             rejection_log = pd.DataFrame()
         if original_rows is None:
@@ -375,11 +387,12 @@ class Writer:
                 log.warning("Azure upload failed after %d retries: %s",
                             _AZURE_MAX_RETRIES, exc)
         else:
-            log.warning("AZURE_STORAGE_CONNECTION_STRING or AZURE_CONTAINER not set "
-                        "— skipping cloud upload")
+            log.warning("AZURE_STORAGE_CONNECTION_STRING or AZURE_CONTAINER not set"
+                        ", skipping cloud upload")
         return outputs
 
     def _upload_to_azure(self, paths: list[Path], conn_str: str, container: str) -> str:
+        # uploads each file in the list; each gets up to 3 attempts with exponential backoff (2s -> 4s -> 8s)
         try:
             from azure.storage.blob import BlobServiceClient
         except ImportError as exc:
@@ -405,9 +418,10 @@ class Writer:
 
     def _build_report(self, df: pd.DataFrame, source_name: str,
                       original_rows: int, quality_score: float) -> str:
+        # builds a readable text report: quality score, price/rating averages, and per-category/tier/band breakdowns
         rejected = original_rows - len(df)
         lines = [
-            f"=== Pipeline Report — {source_name} ===",
+            f"=== Pipeline Report, {source_name} ===",
             f"Source file          : {source_name}",
             f"Original rows        : {original_rows:,}",
             f"Rows written         : {len(df):,}",
@@ -440,6 +454,7 @@ class Writer:
         return "\n".join(lines) + "\n"
 
 
+# convenience wrapper that chains all stages together for standalone runs outside Airflow
 class Pipeline:
     def __init__(self, output_dir: str | Path = "output") -> None:
         self.validator        = Validator()
@@ -448,6 +463,7 @@ class Pipeline:
         self.writer           = Writer(output_dir)
 
     def run(self, file_path: str | Path) -> dict[str, Path | str]:
+        # runs the full pipeline for a single file and returns a dict of all output paths
         file_path     = Path(file_path)
         df            = Reader(file_path).read()
         original_rows = len(df)

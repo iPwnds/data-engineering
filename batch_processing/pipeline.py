@@ -11,6 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 log = logging.getLogger("pipeline")
 
 
+# defines what's valid for one column: whether it's required, its allowed numeric range, and any fixed set of acceptable values
 @dataclass(frozen=True)
 class ColumnRule:
     mandatory: bool
@@ -89,12 +90,12 @@ COLUMN_RULES: dict[str, ColumnRule] = {
     "store_and_fwd_flag": ColumnRule(
         mandatory=False,
         valid_values=frozenset({"Y", "N"}),
-        description="Trip held in vehicle memory; Y or N — dropped after validation",
+        description="Trip held in vehicle memory; Y or N, dropped after validation",
     ),
     "RatecodeID": ColumnRule(
         mandatory=False,
         valid_values=frozenset({1, 2, 3, 4, 5, 6}),
-        description="Rate code 1–6 — dropped after validation",
+        description="Rate code 1–6, dropped after validation",
     ),
 }
 
@@ -104,6 +105,7 @@ NON_MANDATORY_COLUMNS = {c for c, r in COLUMN_RULES.items() if not r.mandatory}
 DROPPED_COLUMNS = {"VendorID", "store_and_fwd_flag", "RatecodeID"}
 
 
+# returned by both validators, fatal=True means a required column is missing and the pipeline must stop immediately
 @dataclass
 class ValidationResult:
     fatal: bool = False
@@ -118,7 +120,7 @@ class ValidationResult:
         if self.fatal:
             status = "FATAL"
         elif self.errors:
-            status = "PASS (data-quality issues found — rows will be dropped)"
+            status = "PASS (data-quality issues found, rows will be dropped)"
         else:
             status = "PASS"
         lines = [status]
@@ -129,12 +131,14 @@ class ValidationResult:
         return "\n".join(lines)
 
 
+# loads the source parquet file into a DataFrame
 class Reader:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
     def read(self) -> pd.DataFrame:
+        # checks the file exists, loads the parquet, and logs the row/column count
         log.info("Reading %s", self.path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
@@ -143,8 +147,10 @@ class Reader:
         return df
 
 
+# pre-processing check that runs before any cleaning, flags data quality issues and stops the pipeline on schema errors
 class Validator:
     def validate(self, df: pd.DataFrame) -> ValidationResult:
+        # walks every column rule and checks for missing columns, nulls, out-of-range values, and invalid enum values
         log.info("Running pre-processing validation …")
         result = ValidationResult()
         n = len(df)
@@ -167,7 +173,7 @@ class Validator:
 
             nulls = series.isna().sum()
             if nulls:
-                suffix = " — rows will be dropped" if rule.mandatory else ""
+                suffix = ", rows will be dropped" if rule.mandatory else ""
                 add(f"{col} ({tag}): {nulls:,} null values ({nulls/n:.1%}){suffix}")
 
             non_null = series.dropna()
@@ -175,13 +181,13 @@ class Validator:
             if rule.min_val is not None:
                 bad = (non_null < rule.min_val).sum()
                 if bad:
-                    suffix = " — rows will be dropped" if rule.mandatory else ""
+                    suffix = ", rows will be dropped" if rule.mandatory else ""
                     add(f"{col} ({tag}): {bad:,} values < minimum {rule.min_val}{suffix}")
 
             if rule.max_val is not None:
                 bad = (non_null > rule.max_val).sum()
                 if bad:
-                    suffix = " — rows will be dropped" if rule.mandatory else ""
+                    suffix = ", rows will be dropped" if rule.mandatory else ""
                     add(f"{col} ({tag}): {bad:,} values > maximum {rule.max_val}{suffix}")
 
             if rule.valid_values is not None:
@@ -192,7 +198,7 @@ class Validator:
                 )
                 bad = (~check.isin(rule.valid_values)).sum()
                 if bad:
-                    suffix = " — rows will be dropped" if rule.mandatory else ""
+                    suffix = ", rows will be dropped" if rule.mandatory else ""
                     add(f"{col} ({tag}): {bad:,} values outside {set(rule.valid_values)}{suffix}")
 
         if {"tpep_pickup_datetime", "tpep_dropoff_datetime"} <= set(df.columns):
@@ -200,13 +206,14 @@ class Validator:
             if bad_order:
                 result.errors.append(
                     f"tpep_dropoff_datetime ≤ tpep_pickup_datetime "
-                    f"in {bad_order:,} rows — rows will be dropped"
+                    f"in {bad_order:,} rows, rows will be dropped"
                 )
 
         log.info("Pre-validation result:\n%s", result)
         return result
 
 
+# removes invalid rows, fills optional nulls with 0, and adds 10 new derived columns
 class Processor:
     MAX_TRIP_HOURS    = 6
     MAX_TRIP_DISTANCE = 200.0
@@ -219,21 +226,30 @@ class Processor:
     _FARE_LABELS = ["Low", "Medium", "High"]          # Low<20  Medium 20–50  High>50
 
     _TIME_BINS   = [-1,   6,  12,  18,  24]
-    _TIME_LABELS = ["Night", "Morning", "Afternoon", "Evening"]  # 0–5  6–11  12–17  18–23
+    _TIME_LABELS = ["Night", "Morning", "Afternoon", "Evening"]  # 0–6  7–12  13–18  19–23
 
     def process(self, df: pd.DataFrame) -> pd.DataFrame:
+        # cleans in stages: remove invalid rows -> fill optional nulls with 0 -> add derived columns -> drop unwanted columns
         log.info("Processing %d rows …", len(df))
         df = df.copy()
 
         # drop rows with nulls in any required field
         before = len(df)
         df = df.dropna(subset=list(MANDATORY_COLUMNS & set(df.columns)))
-        log.info("  Dropped %d rows — nulls in mandatory columns", before - len(df))
+        log.info("  Dropped %d rows, nulls in mandatory columns", before - len(df))
 
         # dropoff must come after pickup
         before = len(df)
         df = df[df["tpep_dropoff_datetime"] > df["tpep_pickup_datetime"]]
-        log.info("  Dropped %d rows — dropoff ≤ pickup", before - len(df))
+        log.info("  Dropped %d rows, dropoff ≤ pickup", before - len(df))
+
+        # keep only January 2025 trips, a handful of rows bleed in from Dec 2024 / Feb 2025
+        before = len(df)
+        df = df[
+            (df["tpep_pickup_datetime"].dt.year == 2025) &
+            (df["tpep_pickup_datetime"].dt.month == 1)
+        ]
+        log.info("  Dropped %d rows, pickup outside January 2025", before - len(df))
 
         # passenger count, distance, location IDs, payment type, fare
         before = len(df)
@@ -246,7 +262,7 @@ class Processor:
             (df["fare_amount"]  >= 0) &
             (df["total_amount"] >= 0)
         ]
-        log.info("  Dropped %d rows — mandatory column domain violations", before - len(df))
+        log.info("  Dropped %d rows, mandatory column domain violations", before - len(df))
 
         # compute duration, then cut anything unreasonably long or expensive
         df["trip_duration_minutes"] = (
@@ -259,7 +275,7 @@ class Processor:
             (df["fare_amount"]  <= self.MAX_FARE) &
             (df["total_amount"] <= self.MAX_FARE)
         ]
-        log.info("  Dropped %d rows — extreme outliers (duration/fare)", before - len(df))
+        log.info("  Dropped %d rows, extreme outliers (duration/fare)", before - len(df))
 
         # optional columns default to 0
         df["congestion_surcharge"] = df["congestion_surcharge"].fillna(0.0)
@@ -305,19 +321,21 @@ class Processor:
 
         df = df.drop(columns=list(DROPPED_COLUMNS & set(df.columns)))
 
-        log.info("Processing complete — %d rows, %d cols", *df.shape)
+        log.info("Processing complete, %d rows, %d cols", *df.shape)
         return df
 
 
 _EXPECTED_DERIVED = {
     "trip_duration_minutes", "average_speed_mph",
-    "pickup_year", "pickup_month", "pickup_hour", "pickup_day_of_week",
+    "pickup_year", "pickup_month", "pickup_hour", "pickup_day_of_week", "pickup_date",
     "revenue_per_mile", "trip_distance_category", "fare_category", "trip_time_of_day",
 }
 
 
+# post-processing sanity check, verifies the processor did what it was supposed to and no impossible values slipped through
 class BackupValidator:
     def validate(self, df: pd.DataFrame) -> ValidationResult:
+        # confirms all derived columns were created, all dropped columns are gone, and no nulls remain in mandatory fields
         log.info("Running backup (post-processing) validation …")
         result = ValidationResult()
 
@@ -383,6 +401,7 @@ class BackupValidator:
         return result
 
 
+# saves the cleaned parquet and a text report locally, then uploads both to Azure Blob Storage
 class Writer:
     OUTPUT_FILENAME = "yellow_tripdata_2025-01_processed.parquet"
     REPORT_FILENAME = "pipeline_report.txt"
@@ -392,6 +411,7 @@ class Writer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def write(self, df: pd.DataFrame, original_rows: int | None = None) -> dict[str, Path | str]:
+        # writes cleaned parquet and summary report locally; uploads to Azure if the connection string env var is set
         if original_rows is None:
             original_rows = len(df)
         data_path   = self.output_dir / self.OUTPUT_FILENAME
@@ -416,7 +436,7 @@ class Writer:
             outputs["azure_report"] = f"{azure_url}/{self.REPORT_FILENAME}"
         else:
             log.warning(
-                "AZURE_STORAGE_CONNECTION_STRING or AZURE_CONTAINER not set — "
+                "AZURE_STORAGE_CONNECTION_STRING or AZURE_CONTAINER not set, "
                 "skipping cloud upload"
             )
 
@@ -429,6 +449,7 @@ class Writer:
         conn_str: str,
         container: str,
     ) -> str:
+        # uploads the data file and report; retries up to 3 times with 2s -> 4s -> 8s delays between attempts
         import time
         try:
             from azure.storage.blob import BlobServiceClient
@@ -463,6 +484,7 @@ class Writer:
         return base_url
 
     def _build_report(self, df: pd.DataFrame, original_rows: int) -> str:
+        # builds the plain-text summary: quality score, trip averages, and breakdowns by distance/fare/time of day/payment
         quality_score = len(df) / original_rows * 100 if original_rows > 0 else 0.0
         lines = [
             "=== Pipeline Report ===",
@@ -510,6 +532,7 @@ class Writer:
         return "\n".join(lines) + "\n"
 
 
+# convenience wrapper that chains all stages together for standalone runs outside Airflow
 class Pipeline:
     def __init__(self, source: str | Path, output_dir: str | Path) -> None:
         self.reader           = Reader(source)
@@ -519,6 +542,7 @@ class Pipeline:
         self.writer           = Writer(output_dir)
 
     def run(self) -> dict[str, Path | str]:
+        # runs all pipeline stages in order and returns a dict of output file paths
         df = self.reader.read()
         original_rows = len(df)
 

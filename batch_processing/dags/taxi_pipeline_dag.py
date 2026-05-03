@@ -9,16 +9,14 @@ from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-# batch_processing/ is one level above this dags/ folder
+# batch_processing is one level above this dags folder
 _BATCH_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_BATCH_DIR))
 
 from pipeline import (  # noqa: E402
     BackupValidator,
-    Pipeline,
     Processor,
     Reader,
-    ValidationResult,
     Validator,
     Writer,
 )
@@ -26,14 +24,15 @@ from pipeline import (  # noqa: E402
 log = logging.getLogger(__name__)
 
 SOURCE_PATH = str(_BATCH_DIR / "input" / "yellow_tripdata_2025-01.parquet")
-OUTPUT_DIR  = str(_BATCH_DIR / "output")
+OUTPUT_DIR = str(_BATCH_DIR / "output")
 
-# intermediate files in /tmp so we don't pass large DataFrames through XCom
-_TMP_RAW  = "/tmp/taxi_raw.parquet"
+# intermediate files in tmp so we don't pass large DataFrames through XCom
+_TMP_RAW = "/tmp/taxi_raw.parquet"
 _TMP_PROC = "/tmp/taxi_processed.parquet"
 
 
 def task_read(**context) -> str:
+    # reads the parquet file and stages it in tmp; also pushes the original row count to XCom so the writer can compute the quality score
     reader = Reader(SOURCE_PATH)
     df = reader.read()
     df.to_parquet(_TMP_RAW, index=False)
@@ -44,6 +43,7 @@ def task_read(**context) -> str:
 
 
 def task_validate(**context) -> str:
+    # pulls the staged parquet from tmp, runs the pre-processing validator, and halts if a mandatory column is missing
     import pandas as pd
 
     path = context["task_instance"].xcom_pull(task_ids="read")
@@ -52,15 +52,18 @@ def task_validate(**context) -> str:
     validator = Validator()
     result = validator.validate(df)
 
-    # fatal means a required column is missing — no point continuing
+    # fatal means a required column is missing, no point continuing
     if result.fatal:
         raise RuntimeError(f"Pre-validation fatal:\n{result}")
 
-    log.info("Pre-validation passed (errors are row-level and will be handled by processor).")
+    log.info(
+        "Pre-validation passed (errors are row-level and will be handled by processor)."
+    )
     return path
 
 
 def task_process(**context) -> str:
+    # runs the processor on the validated data and writes the cleaned result back to tmp
     import pandas as pd
 
     path = context["task_instance"].xcom_pull(task_ids="validate")
@@ -74,6 +77,7 @@ def task_process(**context) -> str:
 
 
 def task_backup_validate(**context) -> str:
+    # confirms the processor added all expected derived columns and no bad values survived cleaning
     import pandas as pd
 
     path = context["task_instance"].xcom_pull(task_ids="process")
@@ -91,12 +95,15 @@ def task_backup_validate(**context) -> str:
 
 
 def task_write(**context) -> dict[str, str]:
+    # writes the cleaned parquet and report locally, then uploads both to Azure; returns a dict of output paths
     import pandas as pd
 
     path = context["task_instance"].xcom_pull(task_ids="backup_validate")
     df = pd.read_parquet(path)
     # pull original row count from the read task to calculate data quality score
-    original_rows = context["task_instance"].xcom_pull(task_ids="read", key="original_rows")
+    original_rows = context["task_instance"].xcom_pull(
+        task_ids="read", key="original_rows"
+    )
 
     writer = Writer(OUTPUT_DIR)
     outputs = writer.write(df, original_rows=original_rows)
@@ -105,36 +112,35 @@ def task_write(**context) -> dict[str, str]:
 
 
 with DAG(
-    dag_id     = "nyc_taxi_pipeline",
-    start_date = datetime(2026, 1, 1),
-    schedule   = "0 8 4 5 *",  # defence: 4 May 2026 08:00
-    catchup    = False,         # don't backfill missed runs
-    tags       = ["taxi", "data-engineering"],
+    dag_id="nyc_taxi_pipeline",
+    start_date=datetime(2026, 1, 1),
+    schedule="0 8 4 5 *",  # defence: 4 May 2026 08:00
+    catchup=False,  # don't backfill missed runs
+    tags=["taxi", "data-engineering"],
 ) as dag:
-
     read = PythonOperator(
-        task_id         = "read",
-        python_callable = task_read,
+        task_id="read",
+        python_callable=task_read,
     )
 
     validate = PythonOperator(
-        task_id         = "validate",
-        python_callable = task_validate,
+        task_id="validate",
+        python_callable=task_validate,
     )
 
     process = PythonOperator(
-        task_id         = "process",
-        python_callable = task_process,
+        task_id="process",
+        python_callable=task_process,
     )
 
     backup_validate = PythonOperator(
-        task_id         = "backup_validate",
-        python_callable = task_backup_validate,
+        task_id="backup_validate",
+        python_callable=task_backup_validate,
     )
 
     write = PythonOperator(
-        task_id         = "write",
-        python_callable = task_write,
+        task_id="write",
+        python_callable=task_write,
     )
 
     read >> validate >> process >> backup_validate >> write
