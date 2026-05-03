@@ -36,7 +36,7 @@ Two-part data engineering pipeline built with Python, Pandas, Airflow, and Azure
 ### Prerequisites
 
 - Python 3.11+
-- Apache Airflow 2.8+ (for DAG execution)
+- Apache Airflow 3.x (for DAG execution)
 - An Azure Storage account (optional — pipelines run fully locally without it)
 
 ### Install dependencies
@@ -83,10 +83,10 @@ python pipeline.py
 ### Run via Airflow
 
 ```bash
-# Point Airflow at the dags folder
-export AIRFLOW__CORE__DAGS_FOLDER=/path/to/project/batch_processing/dags
+# Symlink the DAG file into Airflow's dags folder (one-time setup)
+ln -sf "$(pwd)/batch_processing/dags/taxi_pipeline_dag.py" ~/airflow/dags/taxi_pipeline_dag.py
 
-airflow db migrate
+airflow dags reserialize
 airflow dags trigger nyc_taxi_pipeline
 ```
 
@@ -96,13 +96,13 @@ airflow dags trigger nyc_taxi_pipeline
 |-------|-------------|
 | Reader | Reads `yellow_tripdata_2025-01.parquet` |
 | Validator | Checks mandatory/non-mandatory columns against per-column rules; fatal on missing column |
-| Processor | Drops invalid rows, fills optional nulls, derives 10 new columns |
+| Processor | Drops invalid rows (including out-of-month trips), fills optional nulls, derives 11 new columns |
 | BackupValidator | Confirms derived columns exist and no impossible values survived |
 | Writer | Writes processed parquet + report locally; uploads to Azure with 3-retry back-off |
 
 ### Derived columns added
 
-`trip_duration_minutes` · `average_speed_mph` · `pickup_year` · `pickup_month` · `pickup_hour` · `pickup_day_of_week` · `revenue_per_mile` · `trip_distance_category` · `fare_category` · `trip_time_of_day`
+`trip_duration_minutes` · `average_speed_mph` · `pickup_year` · `pickup_month` · `pickup_hour` · `pickup_day_of_week` · `pickup_date` · `revenue_per_mile` · `trip_distance_category` · `fare_category` · `trip_time_of_day`
 
 ### Dropped columns
 
@@ -129,9 +129,10 @@ python3 pipeline_rt.py input/amazon.csv
 ### Run via Airflow (file-triggered)
 
 ```bash
-export AIRFLOW__CORE__DAGS_FOLDER=/path/to/project/real_time_processing/dags
+# Symlink the DAG file into Airflow's dags folder (one-time setup)
+ln -sf "$(pwd)/real_time_processing/dags/rt_pipeline_dag.py" ~/airflow/dags/rt_pipeline_dag.py
 
-airflow db migrate
+airflow dags reserialize
 airflow dags unpause rt_ecommerce_pipeline
 ```
 
@@ -232,4 +233,5 @@ Calculated as: `(valid rows written / total rows read) × 100`
 
 ## Deadline
 
-**3 May 2026 23:59**
+**Submission:** 3 May 2026 23:59  
+**Defence:** 4 May 2026 08:00
